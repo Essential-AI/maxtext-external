@@ -185,6 +185,10 @@ class Decoder(nn.Module):
       from layers import llama2
 
       return llama2.LlamaDecoderLayer
+    elif self.config.decoder_block == "deepseek":
+      from layers import deepseek
+
+      return deepseek.DeepSeekDecoderLayer
     elif self.config.decoder_block == "mistral":
       # TODO(ranran): update to Mistral with sliding window attention
       from layers import mistral
@@ -214,7 +218,7 @@ class Decoder(nn.Module):
       raise ValueError(f"Incorrect decoder_block name {self.config.decoder_block=}")
 
   def get_norm_layer(self):
-    if self.config.decoder_block in ("default", "llama2", "mistral", "gemma", "gemma2", "simple", "simple_mlp"):
+    if self.config.decoder_block in ("default", "llama2", "mistral", "gemma", "gemma2", "simple", "simple_mlp", "deepseek"):
       return RMSNorm
     elif self.config.decoder_block == "gpt3":
       from layers import gpt3
@@ -366,12 +370,23 @@ class Decoder(nn.Module):
         assert cfg.remat_policy == "full", "Remat policy needs to be on list of remat policies"
         policy = None
 
+    # We pass in a boolean to indicate whether the layer is a dense layer or
+    # not.  This is better than passing in the layer number, because the
+    # argument must be static, so we would have to recompile for every layer.
+    if cfg.num_dense_layers >= 0:
+      if cfg.scan_layers:
+        raise ValueError("scan_layers is not supported with num_dense_layers >= 0")
+      supply_layer_num = True
+    else:
+      supply_layer_num = False
+
     RemattedBlockLayer = nn.remat(  # pylint: disable=invalid-name
         BlockLayer,
         prevent_cse=not cfg.scan_layers,
         policy=policy,
-        static_argnums=(4, 5),  # Deterministic and model mode are static arguments.
+        static_argnums=(4, 5) if not supply_layer_num else (4, 5, 6),  # Deterministic and model mode are static arguments.
     )
+
     if cfg.using_pipeline_parallelism:
       base_stage = RemattedBlockLayer if cfg.set_remat_policy_on_layers_per_stage else BlockLayer
       stage_module = self.get_pipeline_stage_module(base_stage, cfg, mesh)
@@ -391,6 +406,16 @@ class Decoder(nn.Module):
             deterministic,
             model_mode,
         )
+      elif supply_layer_num:
+        for lyr in range(cfg.num_decoder_layers):
+          y = RemattedBlockLayer(config=cfg, mesh=mesh, name=f"layers_{lyr}", quant=self.quant)(
+              y,
+              decoder_segment_ids,
+              decoder_positions,
+              deterministic,
+              model_mode,
+              lyr < cfg.num_dense_layers,
+          )
       else:
         for lyr in range(cfg.num_decoder_layers):
           y = RemattedBlockLayer(config=cfg, mesh=mesh, name=f"layers_{lyr}", quant=self.quant)(

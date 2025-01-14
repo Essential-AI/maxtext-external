@@ -139,21 +139,57 @@ def calculate_tflops_training_per_device(config, log=True):
 
   if config.num_experts > 1:
     # MoE: brute force implementation
+    activated_experts = config.num_experts_per_tok + config.num_shared_experts
     gate_flops = 2 * config.per_device_batch_size * config.max_target_length * config.emb_dim * config.num_experts
-    total_ffn_flops = gate_flops + config.num_experts_per_tok * total_ffn_flops
+    total_ffn_flops = gate_flops + activated_experts * total_ffn_flops
 
-  qkv_flops = (
-      2
-      * config.per_device_batch_size
-      * config.max_target_length
-      * config.emb_dim
-      * (config.num_query_heads + 2 * config.num_kv_heads)
-      * config.head_dim
-  )
-  attention_flops = 4 * config.per_device_batch_size * config.max_target_length**2 * config.num_query_heads * config.head_dim
+  # XXX need to separately calculate dense layers -- although i think only gate_flops are different?
+
+  if config.decoder_block != "deepseek":
+    qkv_flops = (
+        2
+        * config.per_device_batch_size
+        * config.max_target_length
+        * config.emb_dim
+        * (config.num_query_heads + 2 * config.num_kv_heads)
+        * config.head_dim
+    )
+    attention_flops = 4 * config.per_device_batch_size * config.max_target_length**2 * config.num_query_heads * config.head_dim
+  else:
+    for_all = 2 * config.per_device_batch_size * config.max_target_length
+    if config.q_lora_rank == 0:
+      q_flops = config.emb_dim * config.num_query_heads * (config.qk_nope_head_dim + config.qk_rope_head_dim)
+    else:
+      q_flops = (
+          config.emb_dim * config.q_lora_rank
+          + config.q_lora_rank * config.num_query_heads * (config.qk_nope_head_dim + config.qk_rope_head_dim)
+      )
+    kv_down_flops = config.emb_dim * (config.kv_lora_rank + config.qk_rope_head_dim)
+    kv_up_flops = config.kv_lora_rank * config.num_query_heads * (config.qk_nope_head_dim + config.head_dim)
+    qkv_flops = for_all * (q_flops + kv_down_flops + kv_up_flops)
+
+    qk_flops = (
+        2
+        * config.per_device_batch_size
+        * config.max_target_length**2
+        * config.num_query_heads
+        * (config.qk_nope_head_dim + config.qk_rope_head_dim)
+    )
+
+    wv_flops = (
+        2
+        * config.per_device_batch_size
+        * config.max_target_length**2
+        * config.num_query_heads
+        * config.head_dim
+    )
+
+    attention_flops = qk_flops + wv_flops
+
   projection_flops = (
       2 * config.per_device_batch_size * config.max_target_length * config.emb_dim * config.num_query_heads * config.head_dim
   )
+
   embedding_flops = 2 * config.per_device_batch_size * config.max_target_length * config.emb_dim * config.vocab_size
 
   # multiply by 3 for both feed forward and back propagation flops

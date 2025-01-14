@@ -33,6 +33,7 @@ from kernels.ragged_attention import ragged_mha
 from layers import embeddings
 from layers import initializers
 from layers import linears
+from layers import normalizations
 from layers import quantizations
 
 
@@ -57,6 +58,7 @@ NdInitializer = initializers.NdInitializer
 Quant = quantizations.AqtQuantization
 KVQuant = quantizations.KVQuant
 KVTensor = quantizations.KVTensor
+RMSNorm = normalizations.RMSNorm
 
 AxisNames = common_types.AxisNames
 AxisIdxes = common_types.AxisIdxes
@@ -985,12 +987,13 @@ class AttentionOp(nn.Module):
       two tuples of (k, v, decoder_segments) -- either can be Nones
 
     """
+    if model_mode == common_types.MODEL_MODE_TRAIN:
+      return (key, value, decoder_segment_ids), None
+
     if key.shape != value.shape:
       raise ValueError(f"Can't KV cache with mismatched shapes {key.shape=}, {value.shape=}")
 
-    if model_mode == common_types.MODEL_MODE_TRAIN:
-      return (key, value, decoder_segment_ids), None
-    elif model_mode == common_types.MODEL_MODE_PREFILL:
+    if model_mode == common_types.MODEL_MODE_PREFILL:
       return self.kv_cache_prefill(key, value, decoder_segment_ids), None
     elif model_mode == common_types.MODEL_MODE_AUTOREGRESSIVE:
       return self.kv_cache_autoregressive(key, value, use_ragged_attention)
@@ -1325,6 +1328,333 @@ class Attention(nn.Module):
     out = nn.with_logical_constraint(out, self.out_axis_names)
 
     # apply output projection,  output dim is set to the input dim.
+    out = self.out_projection(inputs_q.shape[-1], out)
+    out = checkpoint_name(out, "out_proj")
+    return out
+
+
+class MLA(nn.Module):
+  """Multihead Latent Attention, from DeepSeek-V2
+
+  Attributes:
+    num_heads: number of attention heads.
+    q_lora_rank: rank of the down-projection of the query.
+    kv_lora_rank: rank of the down-projection of the key and value.
+    qk_nope_head_dim: dimension of the non-positional portion of the query and key projection.
+    qk_rope_head_dim: dimension of the positional portion of the query and key projection.
+    v_head_dim: dimension of the value projection.
+    mesh: Mesh, device mesh
+    attention_kernel: str, guidance on if we should use an attention kernel
+    dtype: the dtype of the computation.
+    weight_dtype: the dtype of the weights.
+    max_target_length: maximum target length
+    max_prefill_predict_length: size of the maximum prefill
+    dropout_rate: dropout rate
+    kernel_init: initializer for the kernel of the Dense layers.
+    float32_qk_product: bool, if True then compute logits via float32 qk_product to avoid
+      numerical issues with bfloat16.
+    float32_logits: bool, if True then cast logits to float32 before softmax to avoid
+      numerical issues with bfloat16.
+    quant: Quant, stores quantization parameters, defaults to None implying no quantization.
+    kv_quant: KVQuant, stores KV cache quantization parameters, defaults to None
+  """
+
+  config: Config
+  num_heads: int
+  q_lora_rank: int
+  kv_lora_rank: int
+  qk_nope_head_dim: int
+  qk_rope_head_dim: int
+  v_head_dim: int
+  max_target_length: int
+  mesh: Mesh
+  attention_kernel: str
+  dtype: DType = jnp.float32
+  weight_dtype: DType = jnp.float32
+  max_prefill_predict_length: int = -1
+  dropout_rate: float = 0.0
+  kernel_init: NdInitializer = nd_dense_init(1.0, "fan_in", "normal")
+  float32_qk_product: bool = False  # computes logits in float32 for stability.
+  float32_logits: bool = False  # cast logits in float32 for stability.
+  quant: Optional[Quant] = None
+  kv_quant: Optional[KVQuant] = None
+
+  attention_type: AttentionType = AttentionType.GLOBAL  # Default to global attention
+  attn_logits_soft_cap: float | None = None
+  sliding_window_size: int | None = None
+  use_ragged_attention: bool = False
+  ragged_block_size: int = 256
+
+  # Shard the query activation as the same as the key and value.
+  # TODO: Find a better sharding axis name.
+  # TODO: Further break down the Training and Inference axes for the q, k, v.
+  prefill_query_axis_names: AxisNames = (PREFILL_KV_BATCH, LENGTH, KV_HEAD, KV_HEAD_DIM)
+  prefill_key_axis_names: AxisNames = (PREFILL_KV_BATCH, LENGTH, KV_HEAD, KV_HEAD_DIM)
+  prefill_value_axis_names: AxisNames = (PREFILL_KV_BATCH, LENGTH, KV_HEAD, KV_HEAD_DIM)
+  query_axis_names: AxisNames = (KV_BATCH, LENGTH, KV_HEAD, KV_HEAD_DIM)
+  input_axis_names: AxisNames = (BATCH, LENGTH, EMBED)
+  key_axis_names: AxisNames = (KV_BATCH, LENGTH, KV_HEAD, KV_HEAD_DIM)
+  value_axis_names: AxisNames = (KV_BATCH, LENGTH, KV_HEAD, KV_HEAD_DIM)
+  out_axis_names: AxisNames = (BATCH, LENGTH, HEAD, D_KV)
+
+  prefill_cache_axis_order: AxisIdxes = (1, 2, 0, 3)
+  ar_cache_axis_order: AxisIdxes = (1, 2, 0, 3)
+  compute_axis_order: AxisIdxes = (0, 1, 2, 3)
+  reshape_q: bool = False
+
+  def query_projection(self, inputs_q: Array, inputs_positions: Array) -> Array:
+    """Query projection."""
+
+    # NOTE: T5 does not explicitly rescale the attention logits by
+    #       1/sqrt(depth_kq)!  This is folded into the initializers of the
+    #       linear transformations, which is equivalent under Adafactor.
+    depth_scaling = jnp.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim).astype(self.dtype)
+
+    def query_init(*args):
+      # pylint: disable=no-value-for-parameter
+      return self.kernel_init(*args) / depth_scaling
+
+    if self.config.q_lora_rank == 0:
+      query_up_proj = DenseGeneral(
+          features=(self.num_heads, self.qk_nope_head_dim + self.qk_rope_head_dim),
+          axis=-1,
+          kernel_init=query_init,
+          kernel_axes=("embed", "q_heads", "kv"),
+          dtype=self.dtype,
+          weight_dtype=self.weight_dtype,
+          name="query",
+          quant=self.quant,
+          matmul_precision=self.config.matmul_precision,
+      )(inputs_q)
+    else:
+      query_down_proj = DenseGeneral(
+          features=(self.q_lora_rank,),
+          axis=-1,
+          kernel_init=query_init, # or query_init?
+          kernel_axes=("embed", "q_lora"),
+          dtype=self.dtype,
+          weight_dtype=self.weight_dtype,
+          name="query_down",
+          quant=self.quant,
+          matmul_precision=self.config.matmul_precision,
+      )(inputs_q)
+
+      # query_down_proj = nn.with_logical_constraint(query_down_proj, _) # XXX ???
+
+      query_down_proj = RMSNorm(
+          dtype=self.dtype,
+          weight_dtype=self.weight_dtype,
+          name="query_down_norm",
+          kernel_axes=("norm",),
+          epsilon=self.config.normalization_layer_epsilon,
+      )(query_down_proj)
+
+      # for inference, you should only save query_down_proj.  we do not implement
+      # this optimization
+
+      query_up_proj = DenseGeneral(
+          features=(self.num_heads, self.qk_nope_head_dim + self.qk_rope_head_dim),
+          axis=-1,
+          kernel_init=query_init,
+          kernel_axes=("q_lora", "q_heads", "kv"),
+          dtype=self.dtype,
+          weight_dtype=self.weight_dtype,
+          name="query_up",
+          quant=self.quant,
+          matmul_precision=self.config.matmul_precision,
+      )(query_down_proj)
+
+    query_nope, query_rope = jnp.split(query_up_proj, [self.qk_nope_head_dim], axis=-1)
+    query_rope = self.apply_rotary_embedding(query_rope, inputs_positions, name="query_rotary")
+
+    return query_nope, query_rope
+
+  def kv_projection(self, inputs_kv: Array, inputs_positions: Array) -> Array:
+    """Projection for Key and Value.
+
+    Args:
+      inputs_kv: key/values of shape `[batch, kv_length, num_heads, kv_dim]`.
+
+    Returns:
+      Non-positional portion of key: [batch, kv_length, num_heads, qk_nope_head_dim]
+      Positional portion of key: [batch, kv_length, qk_rope_head_dim]
+      Value: [batch, kv_length, num_heads, v_head_dim]
+    """
+
+    kv_down_proj = DenseGeneral(
+        features=(self.kv_lora_rank + self.qk_rope_head_dim,),
+        axis=-1,
+        kernel_init=self.kernel_init,
+        kernel_axes=("embed", "kv_lora"),
+        dtype=self.dtype,
+        weight_dtype=self.weight_dtype,
+        name="kv_down",
+        quant=self.quant,
+        matmul_precision=self.config.matmul_precision,
+    )(inputs_kv)
+
+    latent_nope, latent_rope = jnp.split(kv_down_proj, [self.kv_lora_rank], axis=-1)
+    # [batch, length, qk_rope_head_dim] -> [batch, length, 1, qk_rope_head_dim]
+    latent_rope = jnp.expand_dims(latent_rope, axis=2)
+    key_rope = self.apply_rotary_embedding(latent_rope, inputs_positions, name="key_rotary")
+
+    latent_nope = RMSNorm(
+        dtype=self.dtype,
+        weight_dtype=self.weight_dtype,
+        name="kv_down_norm",
+        kernel_axes=("norm",),
+        epsilon=self.config.normalization_layer_epsilon,
+    )(latent_nope)
+
+    kv_up_proj = DenseGeneral(
+        features=(self.num_heads, self.qk_nope_head_dim + self.v_head_dim),
+        axis=-1,
+        kernel_init=self.kernel_init,
+        kernel_axes=("kv_lora", "kv_heads", "kv_head_dim"),
+        dtype=self.dtype,
+        weight_dtype=self.weight_dtype,
+        name="kv_up",
+        quant=self.quant,
+        matmul_precision=self.config.matmul_precision,
+    )(latent_nope)
+
+    key_nope, value = jnp.split(kv_up_proj, [self.qk_nope_head_dim], axis=-1)
+
+    return key_nope, key_rope, value
+
+  def out_projection(self, output_dim: int, out: Array) -> Array:
+    out_proj = DenseGeneral(
+        features=output_dim,
+        axis=(-2, -1),
+        kernel_init=self.kernel_init,
+        kernel_axes=("heads", "kv", "embed"),
+        dtype=self.dtype,
+        weight_dtype=self.weight_dtype,
+        name="out",
+        quant=self.quant,
+        matmul_precision=self.config.matmul_precision,
+    )(out)
+    return out_proj
+
+  def apply_rotary_embedding(self, inputs: Array, inputs_positions: Array, name: str):
+    if self.config.model_name.startswith("llama3.1"):
+      rotary_embedding = embeddings.LLaMARotaryEmbedding(
+          min_timescale=self.config.rope_min_timescale,
+          max_timescale=self.config.rope_max_timescale,
+          embedding_dims=self.qk_rope_head_dim,
+          fprop_dtype=self.dtype,
+          name=name,
+      )
+    else:
+      rotary_embedding = RotaryEmbedding(
+          min_timescale=self.config.rope_min_timescale,
+          max_timescale=self.config.rope_max_timescale,
+          embedding_dims=self.qk_rope_head_dim,
+          fprop_dtype=self.dtype,
+          name=name,
+      )
+    inputs = rotary_embedding(inputs, inputs_positions)
+    return inputs
+
+  @nn.compact
+  def __call__(
+      self,
+      inputs_q: Array,
+      inputs_kv: Array,
+      inputs_positions: Array,
+      decoder_segment_ids: Array | None = None,
+      *,
+      model_mode: str = common_types.MODEL_MODE_TRAIN,
+      deterministic: bool = False,
+  ):
+    """Applies Attention on the input data.
+
+    Projects the inputs into multi-headed query, key, and value vectors,
+    applies dot-product attention and project the results to an output vector.
+
+    There are three modes: training, prefill and autoregression. During training, the KV cache
+    is ignored. During prefill, the cache is filled. During autoregression the cache is used.
+
+    In the cache initialization call, `inputs_q` has a shape [batch, length,
+    q_features] and `inputs_kv`: [batch, length, kv_features]. During the
+    incremental decoding stage, query, key and value all have the shape [batch,
+    1, qkv_features] corresponding to a single step.
+
+    Args:
+      inputs_q: input queries of shape `[batch, q_length, q_features]`.
+      inputs_kv: key/values of shape `[batch, kv_length, kv_features]`.
+      model_mode: corresponding to train, prefill and decode.
+      deterministic: Disables dropout if set to True.
+
+    Returns:
+      output of shape `[batch, length, q_features]`.
+    """
+    # TODO: in the deepseek code, this is the "naive" implementation.  to
+    # improve this, you can absorb the key and value up-projections into the
+    # query up-projection and output projection, respectively.  this is
+    # important (critical?) for inference if you cache only the latent vector.
+    inputs_q = nn.with_logical_constraint(inputs_q, self.input_axis_names)
+    inputs_kv = nn.with_logical_constraint(inputs_kv, self.input_axis_names)
+
+    # apply projection.
+    if self.config.fused_qkv:
+      raise ValueError("Fused QKV is not supported in MLA.")
+    else:
+      query_nope, query_rope = self.query_projection(inputs_q, inputs_positions)
+      key_nope, key_rope, value = self.kv_projection(inputs_kv, inputs_positions)
+
+    # -> [batch, length, num_heads, qk_nope_head_dim + qk_rope_head_dim]
+    query = jnp.concatenate([query_nope, query_rope], axis=-1)
+
+    # [batch, length, 1, qk_rope_head_dim] -> [batch, length, num_heads, qk_rope_head_dim]
+    key_rope = jnp.tile(key_rope, (1, 1, self.num_heads, 1))
+
+    # -> [batch, length, num_heads, qk_nope_head_dim + qk_rope_head_dim]
+    key = jnp.concatenate([key_nope, key_rope], axis=-1)
+
+    if model_mode == common_types.MODEL_MODE_PREFILL:
+      query = nn.with_logical_constraint(query, self.prefill_query_axis_names)
+      key = nn.with_logical_constraint(key, self.prefill_key_axis_names)
+      value = nn.with_logical_constraint(value, self.prefill_value_axis_names)
+    else:
+      query = nn.with_logical_constraint(query, self.query_axis_names)
+      key = nn.with_logical_constraint(key, self.key_axis_names)
+      value = nn.with_logical_constraint(value, self.value_axis_names)
+    query = checkpoint_name(query, "query_proj")
+    key = checkpoint_name(key, "key_proj")
+    value = checkpoint_name(value, "value_proj")
+
+    assert not self.config.quantize_kvcache or self.kv_quant
+    attention_op = AttentionOp(
+        config=self.config,
+        mesh=self.mesh,
+        attention_kernel=self.attention_kernel,
+        max_target_length=self.max_target_length,
+        max_prefill_predict_length=self.max_prefill_predict_length,
+        float32_qk_product=self.float32_qk_product,
+        float32_logits=self.float32_logits,
+        quant=self.quant,
+        kv_quant=self.kv_quant,
+        num_query_heads=self.num_heads,
+        num_kv_heads=self.num_heads,
+        dropout_rate=self.dropout_rate,
+        dtype=self.dtype,
+        prefill_cache_axis_order=self.prefill_cache_axis_order,
+        ar_cache_axis_order=self.ar_cache_axis_order,
+        compute_axis_order=self.compute_axis_order,
+        reshape_q=self.reshape_q,
+        attention_type=self.attention_type,
+        attn_logits_soft_cap=self.attn_logits_soft_cap,
+        sliding_window_size=self.sliding_window_size,
+        use_ragged_attention=self.use_ragged_attention,
+        ragged_block_size=self.ragged_block_size,
+    )
+
+    out = attention_op(query, key, value, decoder_segment_ids, model_mode)
+
+    out = nn.with_logical_constraint(out, self.out_axis_names)
+
+    # apply output projection, output dim is set to the input dim.
     out = self.out_projection(inputs_q.shape[-1], out)
     out = checkpoint_name(out, "out_proj")
     return out

@@ -371,7 +371,15 @@ class MoeBlock(nn.Module):
     inputs_shape = inputs.shape
     inputs_2d = jnp.reshape(inputs, (inputs_shape[0] * inputs_shape[1], inputs_shape[2]))
     weights, selected_experts = jax.lax.top_k(gate_logits, self.num_experts_per_tok)
-    weights = jax.nn.softmax(weights.astype(jnp.float32), axis=-1).astype(self.dtype)
+
+    if self.config.expert_affinity_function == "softmax":
+      weights = jax.nn.softmax(weights.astype(jnp.float32), axis=-1).astype(self.dtype)
+    elif self.config.expert_affinity_function == "sigmoid":
+      weights = jax.nn.sigmoid(weights.astype(jnp.float32)).astype(self.dtype)
+      weights /= weights.sum(-1, keepdims=True)
+    else:
+      raise ValueError(f"Unknown expert_affinity_function {self.config.expert_affinity_function=}")
+
     flatten_selected_experts = jnp.ravel(selected_experts)
     sorted_selected_experts = jnp.argsort(flatten_selected_experts)
     sorted_indices = sorted_selected_experts // self.num_experts_per_tok
@@ -488,7 +496,7 @@ class MoeBlock(nn.Module):
     update_weights = update_weights.at[index_update].set(weights)
     return update_weights
 
-  def generate_masks(self, top_k_indices, softmax_probs):
+  def generate_masks(self, top_k_indices, all_affinity):
     # calculate expert_capacity = (tokens_per_batch / num_experts) * capacity_factor
     batch_size, seq_len, _ = top_k_indices.shape
     tokens_per_batch = seq_len * self.num_experts_per_tok
@@ -526,7 +534,7 @@ class MoeBlock(nn.Module):
     combined_expert_mask = jnp.sum(trunc_expert_mask, axis=2)
 
     # reshape & update weights
-    softmax_probs *= combined_expert_mask
+    all_affinity *= combined_expert_mask
 
     # calculate token position in expert capacity dimension
     expert_token_position_fused = expert_mask_fused * expert_token_count_fused
@@ -543,7 +551,7 @@ class MoeBlock(nn.Module):
 
     # shape of combine_mask is (batch_size, seq_len, num_experts, expert_capacity_per_batch + 1),
     # and cut 0-dimension which is always 0
-    combine_mask = softmax_probs[..., None] * expert_token_position_in_capacity
+    combine_mask = all_affinity[..., None] * expert_token_position_in_capacity
     combine_mask = combine_mask[..., 1:]
     dispatch_mask = combine_mask.astype(bool)
     return dispatch_mask, combine_mask
@@ -592,19 +600,28 @@ class MoeBlock(nn.Module):
   def dense_matmul(self, inputs, gate_logits, w0_kernel, w1_kernel, wo_kernel):
     # gate_logits: batch, length, expert
     gate_logits = nn.with_logical_constraint(gate_logits, ("activation_batch", "activation_length", None))
-    softmax_probs = jax.nn.softmax(gate_logits.astype(jnp.float32), axis=-1).astype(self.dtype)
     # shape of top_k_weights & top_k_indices: (batch, sequence, num_experts_per_tok)
-    top_k_weights, top_k_indices = jax.lax.top_k(softmax_probs, self.num_experts_per_tok)
+    # XXX add bias-based balancing
+    # ??? is sigmoid-after-topk ok for bias-based balancing?  also in megablox
+    top_k_weights, top_k_indices = jax.lax.top_k(gate_logits, self.num_experts_per_tok)
+    if self.config.expert_affinity_function == "softmax":
+      all_affinity = jax.nn.softmax(top_k_weights.astype(jnp.float32), axis=-1).astype(self.dtype)
+    elif self.config.expert_affinity_function == "sigmoid": # as in DeepSeek-V3
+      top_k_weights = jax.nn.sigmoid(top_k_weights.astype(jnp.float32)).astype(self.dtype) # is up-cast necessary?
+      top_k_weights /= top_k_weights.sum(-1, keepdims=True)
+    else:
+      raise ValueError(f"Unknown expert_affinity_function {self.config.expert_affinity_function=}")
+    all_affinity = self.reshape_and_update_weights(top_k_weights, top_k_indices)
     matmul_precision = lax.Precision(self.config.matmul_precision)
 
     if self.config.capacity_factor > 0:
       # token dropping if needed
-      dispatch_mask, combine_mask = self.generate_masks(top_k_indices, softmax_probs)
+      dispatch_mask, combine_mask = self.generate_masks(top_k_indices, all_affinity)
       mask_axes = ("activation_batch", "activation_length", None, None)
       dispatch_mask = nn.with_logical_constraint(dispatch_mask, mask_axes)
       combine_mask = nn.with_logical_constraint(combine_mask, mask_axes)
-      if self.config.model_call_mode != "inference":
-        loss = self.load_balance_loss(top_k_indices, softmax_probs)
+      if self.config.load_balancing_mode == "loss" and self.config.model_call_mode != "inference":
+        loss = self.load_balance_loss(top_k_indices, all_affinity)
       else:
         loss = None
       inputs = nn.with_logical_constraint(inputs, ("activation_batch", "activation_length", "activation_embed"))
@@ -667,8 +684,6 @@ class MoeBlock(nn.Module):
         ).astype(self.dtype)
       return output, loss
     else:
-      top_k_weights /= top_k_weights.sum(-1, keepdims=True)
-      weights = self.reshape_and_update_weights(top_k_weights, top_k_indices)
       inputs = nn.with_logical_constraint(inputs, ("activation_batch", "activation_length", "activation_embed"))
       with jax.named_scope("wi_0"):
         layer_w0 = self.get_einsum(rhs_mesh_axes=self.wi_kernel_axes)(
@@ -697,7 +712,7 @@ class MoeBlock(nn.Module):
         output = jnp.einsum(
             "BSEM,BSE -> BSM",
             intermediate_layer,
-            weights,
+            all_affinity,
         ).astype(self.dtype)
       return output, None
 
